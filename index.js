@@ -41,6 +41,9 @@ const MAP_SYSTEM_PROMPT = `你是长篇角色扮演聊天的分块压缩器。�
 
 const DEFAULTS = {
     enabled: true,
+    apiMode: 'direct',
+    directBaseUrl: '',
+    directModel: '',
     profileId: '',
     useProfilePreset: true,
     maxOutputTokens: 6000,
@@ -55,6 +58,9 @@ const DEFAULTS = {
 
 let initialized = false;
 let registeredListeners = [];
+let runtimeApiKey = '';
+let activeTab = 'summary';
+let busy = false;
 
 function ctx() {
     const c = getContext();
@@ -66,7 +72,6 @@ function hasActiveChat() {
     const c = ctx();
     return !!c.chatMetadata && Array.isArray(c.chat);
 }
-
 
 function toast(type, message, title = 'RP 大总结') {
     if (window.toastr?.[type]) window.toastr[type](message, title);
@@ -85,7 +90,7 @@ function settings() {
 
 function blankState() {
     return {
-        schemaVersion: 1,
+        schemaVersion: 2,
         longTerm: '',
         currentArc: '',
         summarizedUntil: -1,
@@ -94,16 +99,13 @@ function blankState() {
         dirty: false,
         dirtyReason: '',
         lastSummaryAt: null,
-        lastProfileId: '',
+        lastBackend: '',
         pending: null,
     };
 }
 
 function state() {
     const c = ctx();
-    // Settings UI should still be able to load before a chat is selected.
-    // In that case return a transient blank state; actions that mutate chat memory
-    // explicitly require an active chat.
     if (!c.chatMetadata || typeof c.chatMetadata !== 'object') return blankState();
     if (!c.chatMetadata[META_KEY]) c.chatMetadata[META_KEY] = blankState();
     const st = c.chatMetadata[META_KEY];
@@ -115,8 +117,7 @@ function state() {
 }
 
 async function saveSettings() {
-    const c = ctx();
-    await c.saveSettingsDebounced?.();
+    await ctx().saveSettingsDebounced?.();
 }
 
 async function saveState() {
@@ -129,14 +130,9 @@ function normalizeMemoryText(text) {
 }
 
 function uniqueBulletAppend(existing, additions) {
-    const oldLines = normalizeMemoryText(existing)
-        .split('\n')
-        .map(x => x.trim())
-        .filter(Boolean);
+    const oldLines = normalizeMemoryText(existing).split('\n').map(x => x.trim()).filter(Boolean);
     const normalizedOld = new Set(oldLines.map(x => x.replace(/^[-*•]\s*/, '').trim().toLowerCase()));
-    const newLines = String(additions || '')
-        .split('\n')
-        .map(x => x.trim())
+    const newLines = String(additions || '').split('\n').map(x => x.trim())
         .filter(x => x && !/^none$/i.test(x))
         .map(x => x.replace(/^[-*•]\s*/, '').trim())
         .filter(Boolean)
@@ -185,7 +181,7 @@ async function updateInjection() {
 }
 
 function profileService() {
-    if (!ConnectionManagerRequestService) throw new Error('当前 SillyTavern 没有 ConnectionManagerRequestService，请更新 ST 或启用 Connection Manager。');
+    if (!ConnectionManagerRequestService) throw new Error('当前 SillyTavern 没有 ConnectionManagerRequestService。');
     return ConnectionManagerRequestService;
 }
 
@@ -205,40 +201,102 @@ function profileLabel(p) {
     return bits.join(' · ');
 }
 
-function refreshProfileSelect() {
-    const select = document.querySelector('#rp_big_memory_profile');
-    if (!select) return;
-    const s = settings();
-    const profiles = supportedProfiles();
-    select.innerHTML = '';
-    const empty = document.createElement('option');
-    empty.value = '';
-    empty.textContent = profiles.length ? '请选择副 API Connection Profile' : '没有可用的 Connection Profile';
-    select.appendChild(empty);
-    for (const p of profiles) {
-        const option = document.createElement('option');
-        option.value = p.id;
-        option.textContent = profileLabel(p);
-        if (p.id === s.profileId) option.selected = true;
-        select.appendChild(option);
-    }
-    refreshProfileInfo();
+function normalizeBaseUrl(raw) {
+    let url = String(raw || '').trim().replace(/\/+$/, '');
+    url = url.replace(/\/chat\/completions$/i, '');
+    return url;
 }
 
-function refreshProfileInfo() {
-    const el = document.querySelector('#rp_big_memory_profile_info');
-    if (!el) return;
-    const s = settings();
-    if (!s.profileId) {
-        el.textContent = '副 API 不会使用主聊天连接；请先在 Connection Manager 建立一个独立 Profile。';
-        return;
-    }
+function directModelsUrl() {
+    const base = normalizeBaseUrl(settings().directBaseUrl);
+    if (!base) throw new Error('请先填写 API Base URL。');
+    return `${base}/models`;
+}
+
+function directChatUrl() {
+    const base = normalizeBaseUrl(settings().directBaseUrl);
+    if (!base) throw new Error('请先填写 API Base URL。');
+    return `${base}/chat/completions`;
+}
+
+function directHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    if (runtimeApiKey.trim()) headers.Authorization = `Bearer ${runtimeApiKey.trim()}`;
+    return headers;
+}
+
+async function fetchJson(url, options = {}) {
+    let res;
     try {
-        const p = profileService().getProfile(s.profileId);
-        el.textContent = `API: ${p.api || '未知'} ｜ Model: ${p.model || '未指定'} ｜ Profile preset: ${p.preset || '无'}`;
+        res = await fetch(url, options);
     } catch (e) {
-        el.textContent = `Profile 不可用：${e.message}`;
+        throw new Error(`网络请求失败：${e.message}。如果服务商禁止浏览器跨域请求（CORS），请改用 Connection Profile 模式。`);
     }
+    const text = await res.text();
+    let data;
+    try { data = text ? JSON.parse(text) : {}; }
+    catch { data = { raw: text }; }
+    if (!res.ok) {
+        const msg = data?.error?.message || data?.message || data?.raw || `${res.status} ${res.statusText}`;
+        throw new Error(`API 返回 ${res.status}：${String(msg).slice(0, 500)}`);
+    }
+    return data;
+}
+
+function extractCompletionContent(data) {
+    const messageContent = data?.choices?.[0]?.message?.content;
+    if (typeof messageContent === 'string') return messageContent.trim();
+    if (Array.isArray(messageContent)) {
+        const joined = messageContent.map(x => typeof x === 'string' ? x : (x?.text || x?.content || '')).join('').trim();
+        if (joined) return joined;
+    }
+    if (typeof data?.output_text === 'string') return data.output_text.trim();
+    if (typeof data?.text === 'string') return data.text.trim();
+    return '';
+}
+
+async function sendDirect(messages, maxTokens) {
+    const s = settings();
+    if (!s.directModel) throw new Error('请先拉取并选择模型，或手动填写模型 ID。');
+    const data = await fetchJson(directChatUrl(), {
+        method: 'POST',
+        headers: directHeaders(),
+        body: JSON.stringify({
+            model: s.directModel,
+            messages,
+            max_tokens: Math.max(32, Number(maxTokens) || 6000),
+            temperature: 0.2,
+            stream: false,
+        }),
+    });
+    const content = extractCompletionContent(data);
+    if (!content) throw new Error('副 API 返回成功，但没有找到可用的文本内容。');
+    return content;
+}
+
+async function sendProfile(messages, maxTokens) {
+    const s = settings();
+    if (!s.profileId) throw new Error('请先选择 Connection Profile。');
+    const result = await profileService().sendRequest(
+        s.profileId,
+        messages,
+        Math.max(32, Number(maxTokens) || 6000),
+        {
+            stream: false,
+            extractData: true,
+            includePreset: !!s.useProfilePreset,
+            includeInstruct: !!s.useProfilePreset,
+        },
+    );
+    const content = typeof result === 'string' ? result : result?.content;
+    if (!content || !String(content).trim()) throw new Error('副 API 返回了空内容。');
+    return String(content).trim();
+}
+
+async function sendSecondary(messages, maxTokens) {
+    return settings().apiMode === 'profile'
+        ? sendProfile(messages, maxTokens)
+        : sendDirect(messages, maxTokens);
 }
 
 function messageToText(m, index) {
@@ -283,26 +341,6 @@ function chunkRangeLabel(chunk) {
     return `#${chunk[0].index}–#${chunk[chunk.length - 1].index}`;
 }
 
-async function sendSecondary(messages, maxTokens) {
-    const s = settings();
-    if (!s.profileId) throw new Error('请先选择副 API Connection Profile。');
-    const service = profileService();
-    const result = await service.sendRequest(
-        s.profileId,
-        messages,
-        Math.max(256, Number(maxTokens) || 6000),
-        {
-            stream: false,
-            extractData: true,
-            includePreset: !!s.useProfilePreset,
-            includeInstruct: !!s.useProfilePreset,
-        },
-    );
-    const content = typeof result === 'string' ? result : result?.content;
-    if (!content || !String(content).trim()) throw new Error('副 API 返回了空内容。');
-    return String(content).trim();
-}
-
 function extractTagged(text, tag) {
     const re = new RegExp(`<${tag}>\\s*([\\s\\S]*?)\\s*<\\/${tag}>`, 'i');
     return text.match(re)?.[1]?.trim() ?? '';
@@ -311,16 +349,14 @@ function extractTagged(text, tag) {
 function parseFinalSummary(text) {
     const additions = extractTagged(text, 'stable_additions');
     const currentArc = extractTagged(text, 'current_arc');
-    if (!currentArc) {
-        throw new Error('总结返回格式不完整：找不到 <current_arc>。为避免污染记忆，本次不会写入或隐藏任何楼层。');
-    }
+    if (!currentArc) throw new Error('总结返回格式不完整：找不到 <current_arc>。本次不会写入或隐藏任何楼层。');
     return { additions, currentArc };
 }
 
 async function summarizeChunk(chunk, index, total) {
     const range = chunkRangeLabel(chunk);
     const prompt = `你正在执行长聊天压缩的第一阶段。请只压缩下面这一块原文，不续写。\n\n块：${index + 1}/${total}，范围 ${range}\n\n需要保留：事件因果、人物关系变化、谁知道什么、重要承诺与长期习惯、对后续有意义的亲密偏好、未完成事项、场景连续性。普通重复描写尽量删除。\n\n请使用高密度项目符号输出，不要文学化，不要加入原文没有的事实。\n\n<source>\n${chunk.map(x => x.text).join('\n\n')}\n</source>`;
-    return await sendSecondary([
+    return sendSecondary([
         { role: 'system', content: MAP_SYSTEM_PROMPT },
         { role: 'user', content: prompt },
     ], Math.min(3200, Number(settings().maxOutputTokens) || 6000));
@@ -337,7 +373,7 @@ async function buildFinalSummary(sourceItems) {
     } else {
         const partials = [];
         for (let i = 0; i < chunks.length; i++) {
-            setBusyStatus(`正在分块总结 ${i + 1}/${chunks.length}（${chunkRangeLabel(chunks[i])}）…`);
+            setBusyStatus(`正在分块总结 ${i + 1}/${chunks.length} · ${chunkRangeLabel(chunks[i])}`);
             const part = await summarizeChunk(chunks[i], i, chunks.length);
             partials.push(`【分块 ${i + 1}｜${chunkRangeLabel(chunks[i])}】\n${part}`);
         }
@@ -355,7 +391,8 @@ async function buildFinalSummary(sourceItems) {
 }
 
 function pushHistorySnapshot(st, note) {
-    const snapshot = {
+    st.history ??= [];
+    st.history.push({
         timestamp: new Date().toISOString(),
         note,
         longTerm: st.longTerm,
@@ -364,9 +401,7 @@ function pushHistorySnapshot(st, note) {
         hiddenRanges: structuredClone(st.hiddenRanges || []),
         dirty: !!st.dirty,
         dirtyReason: st.dirtyReason || '',
-    };
-    st.history ??= [];
-    st.history.push(snapshot);
+    });
     if (st.history.length > MAX_HISTORY) st.history.splice(0, st.history.length - MAX_HISTORY);
 }
 
@@ -397,15 +432,16 @@ async function summarizeNow() {
     if (!hasActiveChat()) return toast('warning', '请先打开一个聊天。');
     const s = settings();
     const st = state();
-    if (!s.profileId) return toast('warning', '先选择一个副 API Connection Profile。');
-    if (st.dirty) {
-        return toast('warning', `已总结区域后来发生过修改（${st.dirtyReason || '编辑/Swipe/删除'}）。为避免把旧记忆继续叠上去，请先“重置此聊天记忆”后重新总结。`);
+    if (s.apiMode === 'direct') {
+        if (!s.directBaseUrl) return toast('warning', '先在“副 API”页填写 API 地址。');
+        if (!s.directModel) return toast('warning', '先拉取并选择模型。');
+    } else if (!s.profileId) {
+        return toast('warning', '先选择 Connection Profile。');
     }
+    if (st.dirty) return toast('warning', `已总结区域后来发生过修改（${st.dirtyReason || '编辑/Swipe/删除'}）。请先重置此聊天记忆后重新总结。`);
 
     const { start, end, keep, total } = getPlannedRange();
-    if (end < start) {
-        return toast('info', `没有足够的新楼层可总结。当前共 ${total} 条，设置保留最近 ${keep} 条。`);
-    }
+    if (end < start) return toast('info', `没有足够的新楼层可总结。当前共 ${total} 条，设置保留最近 ${keep} 条。`);
     const items = collectRange(start, end);
     if (!items.length) return toast('info', '选定范围内没有可总结的文本。');
 
@@ -418,7 +454,7 @@ async function summarizeNow() {
         st.longTerm = uniqueBulletAppend(st.longTerm, result.additions);
         st.currentArc = normalizeMemoryText(result.currentArc);
         st.lastSummaryAt = new Date().toISOString();
-        st.lastProfileId = s.profileId;
+        st.lastBackend = s.apiMode === 'direct' ? `${s.directBaseUrl} · ${s.directModel}` : `Profile: ${s.profileId}`;
         st.pending = { start, end, createdAt: new Date().toISOString() };
         await saveState();
         await updateInjection();
@@ -433,13 +469,12 @@ async function summarizeNow() {
             st.pending = null;
             await saveState();
             await updateInjection();
-            toast('success', `已总结 #${start}–#${end}；保留最近 ${keep} 条原文。${result.chunkCount > 1 ? `共使用 ${result.chunkCount} 个分块。` : ''}`);
+            toast('success', `已总结 #${start}–#${end}；保留最近 ${keep} 条原文。${result.chunkCount > 1 ? `共 ${result.chunkCount} 个分块。` : ''}`);
         } catch (hideError) {
-            // Roll back memory if hiding/finalization failed.
             ctx().chatMetadata[META_KEY] = old;
             await saveState();
             await updateInjection();
-            throw new Error(`总结已生成，但隐藏/保存阶段失败，已自动回滚记忆：${hideError.message}`);
+            throw new Error(`总结已生成，但隐藏/保存失败，已自动回滚：${hideError.message}`);
         }
     } catch (e) {
         console.error('[RP Big Memory] summarize failed', e);
@@ -452,8 +487,6 @@ async function summarizeNow() {
 }
 
 async function testApi() {
-    const s = settings();
-    if (!s.profileId) return toast('warning', '先选择副 API Profile。');
     setControlsDisabled(true);
     setBusyStatus('正在测试副 API…');
     try {
@@ -466,6 +499,32 @@ async function testApi() {
         toast('error', `副 API 测试失败：${e.message}`);
     } finally {
         setControlsDisabled(false);
+        setBusyStatus('');
+    }
+}
+
+async function fetchModels() {
+    const s = settings();
+    if (!s.directBaseUrl) return toast('warning', '请先填写 API Base URL。');
+    const button = document.querySelector('#rp_big_memory_fetch_models');
+    if (button) button.disabled = true;
+    setBusyStatus('正在拉取模型列表…');
+    try {
+        const data = await fetchJson(directModelsUrl(), { method: 'GET', headers: directHeaders() });
+        const models = Array.isArray(data?.data) ? data.data : (Array.isArray(data?.models) ? data.models : []);
+        const ids = models.map(x => typeof x === 'string' ? x : (x?.id || x?.name || x?.model)).filter(Boolean);
+        if (!ids.length) throw new Error('接口返回成功，但没有识别到模型列表。你可以直接手填模型 ID。');
+        populateModelSelect(ids);
+        if (!s.directModel || !ids.includes(s.directModel)) {
+            s.directModel = ids[0];
+            await saveSettings();
+        }
+        setModelControlsFromSettings();
+        toast('success', `已拉取 ${ids.length} 个模型。`);
+    } catch (e) {
+        toast('error', `拉取模型失败：${e.message}`);
+    } finally {
+        if (button) button.disabled = false;
         setBusyStatus('');
     }
 }
@@ -515,7 +574,7 @@ async function unhideAll() {
         for (const r of st.hiddenRanges) await slash(`/unhide ${r.start}-${r.end}`);
         st.hiddenRanges = [];
         await saveState();
-        toast('success', '已恢复本插件记录的隐藏楼层。注意：总结记忆仍会注入，若继续使用完整原文，建议暂时关闭“注入记忆”。');
+        toast('success', '已恢复插件记录的隐藏楼层。');
     } catch (e) {
         toast('error', `恢复失败：${e.message}`);
     }
@@ -526,8 +585,7 @@ async function resetChatMemory() {
     if (!hasActiveChat()) return toast('warning', '请先打开一个聊天。');
     const c = ctx();
     const st = state();
-    const ok = window.confirm('这会恢复本插件隐藏的楼层，并清空当前聊天的大总结、进度和版本历史。不会删除聊天原文。确定吗？');
-    if (!ok) return;
+    if (!window.confirm('恢复本插件隐藏的楼层，并清空此聊天的大总结、进度和版本历史？原聊天不会删除。')) return;
     try {
         for (const r of st.hiddenRanges || []) await slash(`/unhide ${r.start}-${r.end}`);
     } catch (e) {
@@ -553,191 +611,357 @@ async function markDirty(messageId, reason) {
 }
 
 function setControlsDisabled(disabled) {
-    document.querySelectorAll('#rp_big_memory_panel button, #rp_big_memory_panel select').forEach(el => {
+    busy = !!disabled;
+    document.querySelectorAll('#rp_big_memory_modal button, #rp_big_memory_modal select').forEach(el => {
         if (el.id !== 'rp_big_memory_close') el.disabled = !!disabled;
     });
+    document.querySelector('#rp_big_memory_fab')?.classList.toggle('is-busy', !!disabled);
 }
 
 function setBusyStatus(text) {
     const el = document.querySelector('#rp_big_memory_busy');
-    if (el) {
-        el.textContent = text || '';
-        el.style.display = text ? 'block' : 'none';
-    }
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('show', !!text);
 }
 
 async function tokenCount(text) {
-    try {
-        return await ctx().getTokenCountAsync(String(text || ''));
-    } catch {
-        return null;
-    }
-}
-
-async function refreshUI() {
-    const panel = document.querySelector('#rp_big_memory_panel');
-    if (!panel) return;
-    const s = settings();
-    const activeChat = hasActiveChat();
-    const st = state();
-    const range = activeChat ? getPlannedRange() : { start: 0, end: -1, keep: Number(s.keepRecentMessages) || 0, total: 0 };
-
-    panel.querySelectorAll('#rp_big_memory_summarize, #rp_big_memory_save_memory, #rp_big_memory_rollback, #rp_big_memory_unhide, #rp_big_memory_reset_chat')
-        .forEach(el => { el.disabled = !activeChat; });
-
-    const long = document.querySelector('#rp_big_memory_long');
-    const arc = document.querySelector('#rp_big_memory_arc');
-    if (long && document.activeElement !== long) long.value = st.longTerm || '';
-    if (arc && document.activeElement !== arc) arc.value = st.currentArc || '';
-
-    const status = document.querySelector('#rp_big_memory_status');
-    if (status) {
-        if (!activeChat) {
-            status.innerHTML = '<b>请先打开一个聊天。</b> 插件设置已加载；聊天记忆功能会在进入聊天后启用。';
-        } else {
-            const dirty = st.dirty ? `<span class="rp-mem-danger">⚠ 已总结历史被修改：${escapeHtml(st.dirtyReason || '未知')}</span><br>` : '';
-            status.innerHTML = `${dirty}已总结至：<b>${st.summarizedUntil >= 0 ? `#${st.summarizedUntil}` : '尚未总结'}</b> ｜ 下次范围：<b>${range.end >= range.start ? `#${range.start}–#${range.end}` : '暂无'}</b> ｜ 隐藏段：${st.hiddenRanges?.length || 0} ｜ 可回滚：${st.history?.length || 0}`;
-        }
-    }
-
-    const [lt, at] = await Promise.all([tokenCount(st.longTerm), tokenCount(st.currentArc)]);
-    const sizes = document.querySelector('#rp_big_memory_sizes');
-    if (sizes) sizes.textContent = `长期记忆：${st.longTerm.length.toLocaleString()} 字符${lt !== null ? ` / ~${lt.toLocaleString()} tokens` : ''} ｜ 当前篇章：${st.currentArc.length.toLocaleString()} 字符${at !== null ? ` / ~${at.toLocaleString()} tokens` : ''}`;
-
-    refreshProfileInfo();
+    try { return await ctx().getTokenCountAsync(String(text || '')); }
+    catch { return null; }
 }
 
 function escapeHtml(s) {
     return String(s ?? '').replace(/[&<>'"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[ch]));
 }
 
-function bindSetting(id, key, parser = v => v) {
+function setTab(tab) {
+    activeTab = tab;
+    document.querySelectorAll('.rpbm-tab').forEach(x => x.classList.toggle('active', x.dataset.tab === tab));
+    document.querySelectorAll('.rpbm-page').forEach(x => x.classList.toggle('active', x.dataset.page === tab));
+}
+
+function openModal() {
+    document.querySelector('#rp_big_memory_overlay')?.classList.add('open');
+    document.body.classList.add('rpbm-no-scroll');
+    setTab(activeTab);
+    refreshUI();
+}
+
+function closeModal() {
+    document.querySelector('#rp_big_memory_overlay')?.classList.remove('open');
+    document.body.classList.remove('rpbm-no-scroll');
+}
+
+function populateModelSelect(ids = []) {
+    const select = document.querySelector('#rp_big_memory_model_select');
+    if (!select) return;
+    const current = settings().directModel;
+    select.innerHTML = '<option value="">选择已拉取模型</option>';
+    for (const id of ids.sort((a, b) => a.localeCompare(b))) {
+        const option = document.createElement('option');
+        option.value = id;
+        option.textContent = id;
+        option.selected = id === current;
+        select.appendChild(option);
+    }
+}
+
+function setModelControlsFromSettings() {
+    const s = settings();
+    const select = document.querySelector('#rp_big_memory_model_select');
+    const manual = document.querySelector('#rp_big_memory_model_manual');
+    if (select && [...select.options].some(o => o.value === s.directModel)) select.value = s.directModel;
+    if (manual) manual.value = s.directModel || '';
+}
+
+function refreshProfileSelect() {
+    const select = document.querySelector('#rp_big_memory_profile');
+    if (!select) return;
+    const s = settings();
+    const profiles = supportedProfiles();
+    select.innerHTML = '<option value="">选择 Connection Profile</option>';
+    for (const p of profiles) {
+        const option = document.createElement('option');
+        option.value = p.id;
+        option.textContent = profileLabel(p);
+        option.selected = p.id === s.profileId;
+        select.appendChild(option);
+    }
+}
+
+function updateApiModeUI() {
+    const mode = settings().apiMode;
+    document.querySelectorAll('[data-api-mode]').forEach(x => x.classList.toggle('active', x.dataset.apiMode === mode));
+    document.querySelector('#rp_big_memory_direct_box')?.classList.toggle('hidden', mode !== 'direct');
+    document.querySelector('#rp_big_memory_profile_box')?.classList.toggle('hidden', mode !== 'profile');
+}
+
+async function refreshUI() {
+    const modal = document.querySelector('#rp_big_memory_modal');
+    if (!modal) return;
+    const s = settings();
+    const activeChat = hasActiveChat();
+    const st = state();
+    const range = activeChat ? getPlannedRange() : { start: 0, end: -1, keep: Number(s.keepRecentMessages) || 0, total: 0 };
+
+    const status = document.querySelector('#rp_big_memory_status_text');
+    if (status) {
+        if (!activeChat) status.textContent = '还没有打开聊天';
+        else if (st.dirty) status.textContent = `⚠ 记忆可能过期：${st.dirtyReason || '旧楼被修改'}`;
+        else if (st.summarizedUntil >= 0) status.textContent = `已总结至 #${st.summarizedUntil}`;
+        else status.textContent = '尚未生成大总结';
+    }
+
+    const rangeEl = document.querySelector('#rp_big_memory_range_value');
+    if (rangeEl) rangeEl.textContent = activeChat && range.end >= range.start ? `#${range.start} → #${range.end}` : '暂无';
+    const totalEl = document.querySelector('#rp_big_memory_total_value');
+    if (totalEl) totalEl.textContent = activeChat ? `${range.total} 条` : '—';
+    const hiddenEl = document.querySelector('#rp_big_memory_hidden_value');
+    if (hiddenEl) hiddenEl.textContent = activeChat ? `${st.hiddenRanges?.length || 0} 段` : '—';
+
+    const long = document.querySelector('#rp_big_memory_long');
+    const arc = document.querySelector('#rp_big_memory_arc');
+    if (long && document.activeElement !== long) long.value = st.longTerm || '';
+    if (arc && document.activeElement !== arc) arc.value = st.currentArc || '';
+
+    const [lt, at] = await Promise.all([tokenCount(st.longTerm), tokenCount(st.currentArc)]);
+    const size = document.querySelector('#rp_big_memory_size_value');
+    if (size) size.textContent = `${lt ?? '—'} + ${at ?? '—'} tk`;
+    const longMeta = document.querySelector('#rp_big_memory_long_meta');
+    if (longMeta) longMeta.textContent = `${st.longTerm.length.toLocaleString()} 字符${lt !== null ? ` · ~${lt.toLocaleString()} tk` : ''}`;
+    const arcMeta = document.querySelector('#rp_big_memory_arc_meta');
+    if (arcMeta) arcMeta.textContent = `${st.currentArc.length.toLocaleString()} 字符${at !== null ? ` · ~${at.toLocaleString()} tk` : ''}`;
+
+    document.querySelector('#rp_big_memory_summarize')?.toggleAttribute('disabled', !activeChat || busy);
+    document.querySelector('#rp_big_memory_save_memory')?.toggleAttribute('disabled', !activeChat || busy);
+    document.querySelector('#rp_big_memory_rollback')?.toggleAttribute('disabled', !activeChat || !st.history?.length || busy);
+    document.querySelector('#rp_big_memory_unhide')?.toggleAttribute('disabled', !activeChat || !st.hiddenRanges?.length || busy);
+
+    const apiBadge = document.querySelector('#rp_big_memory_api_badge');
+    if (apiBadge) {
+        apiBadge.textContent = s.apiMode === 'direct'
+            ? (s.directModel ? `直连 · ${s.directModel}` : '直连 · 未选模型')
+            : (s.profileId ? 'Connection Profile' : 'Profile 未选择');
+    }
+    updateApiModeUI();
+    setModelControlsFromSettings();
+}
+
+function bindInput(id, key, parser = v => v, eventName = 'change') {
     const el = document.querySelector(id);
     if (!el) return;
     const s = settings();
     if (el.type === 'checkbox') el.checked = !!s[key];
-    else el.value = s[key];
-    el.addEventListener('change', async () => {
+    else el.value = s[key] ?? '';
+    el.addEventListener(eventName, async () => {
         s[key] = el.type === 'checkbox' ? el.checked : parser(el.value);
         await saveSettings();
         if (['enabled', 'injectMemory', 'longTermDepth', 'arcDepth'].includes(key)) await updateInjection();
-        if (key === 'profileId') refreshProfileInfo();
         await refreshUI();
     });
 }
 
-function buildPanel() {
-    if (document.querySelector('#rp_big_memory_panel')) return;
-    const host = document.querySelector('#extensions_settings') || document.querySelector('#extensions_settings2');
-    if (!host) return;
+function buildUI() {
+    if (document.querySelector('#rp_big_memory_fab')) return;
 
-    const wrap = document.createElement('div');
-    wrap.id = 'rp_big_memory_panel';
-    wrap.className = 'extension_container rp-big-memory';
-    wrap.innerHTML = `
-      <div class="inline-drawer">
-        <div class="inline-drawer-toggle inline-drawer-header">
-          <b>🧠 RP 大总结 / Big Memory</b>
-          <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+    const fab = document.createElement('button');
+    fab.id = 'rp_big_memory_fab';
+    fab.type = 'button';
+    fab.title = 'RP 大总结 / Big Memory';
+    fab.setAttribute('aria-label', '打开 RP 大总结');
+    fab.innerHTML = '<span>🧠</span>';
+    document.body.appendChild(fab);
+
+    const overlay = document.createElement('div');
+    overlay.id = 'rp_big_memory_overlay';
+    overlay.innerHTML = `
+      <section id="rp_big_memory_modal" class="rpbm-modal" role="dialog" aria-modal="true" aria-label="RP 大总结">
+        <header class="rpbm-header">
+          <div class="rpbm-brand">
+            <div class="rpbm-logo">🧠</div>
+            <div><h2>Big Memory</h2><p>RP 长期记忆工作台</p></div>
+          </div>
+          <div class="rpbm-header-actions">
+            <span id="rp_big_memory_api_badge" class="rpbm-badge">副 API</span>
+            <button id="rp_big_memory_close" class="rpbm-icon-btn" type="button">✕</button>
+          </div>
+        </header>
+
+        <div class="rpbm-stats">
+          <div class="rpbm-stat"><span>状态</span><b id="rp_big_memory_status_text">—</b></div>
+          <div class="rpbm-stat"><span>下次压缩</span><b id="rp_big_memory_range_value">—</b></div>
+          <div class="rpbm-stat"><span>聊天</span><b id="rp_big_memory_total_value">—</b></div>
+          <div class="rpbm-stat"><span>记忆量</span><b id="rp_big_memory_size_value">—</b></div>
         </div>
-        <div class="inline-drawer-content">
-          <div class="rp-mem-note">副 API 独立总结 → 记忆写入当前聊天 metadata → 注入长期记忆/当前篇章 → 成功后可选隐藏旧楼。原文不会删除。</div>
 
-          <label class="checkbox_label"><input id="rp_big_memory_enabled" type="checkbox"> 启用插件</label>
-          <label class="checkbox_label"><input id="rp_big_memory_inject" type="checkbox"> 将记忆注入主 RP Prompt</label>
-          <label class="checkbox_label"><input id="rp_big_memory_autohide" type="checkbox"> 总结成功后自动隐藏已处理楼层</label>
+        <nav class="rpbm-tabs">
+          <button class="rpbm-tab active" data-tab="summary">总结</button>
+          <button class="rpbm-tab" data-tab="api">副 API</button>
+          <button class="rpbm-tab" data-tab="memory">记忆</button>
+          <button class="rpbm-tab" data-tab="advanced">高级</button>
+        </nav>
 
-          <hr>
-          <label>副 API Connection Profile</label>
-          <div class="rp-mem-row">
-            <select id="rp_big_memory_profile" class="text_pole flex1"></select>
-            <button id="rp_big_memory_refresh_profiles" class="menu_button">刷新</button>
-            <button id="rp_big_memory_test" class="menu_button">测试</button>
-          </div>
-          <div id="rp_big_memory_profile_info" class="rp-mem-subtle"></div>
-          <label class="checkbox_label"><input id="rp_big_memory_profile_preset" type="checkbox"> 使用该 Connection Profile 绑定的 Settings Preset / Instruct</label>
-          <div class="rp-mem-subtle">想用自己的生成参数 / Instruct：在 Connection Manager 新建“总结专用 Profile”并绑定。注意：这不会把主 RP 的整套 Prompt Manager 条目自动复制给副 API；真正的总结/破限前置内容请写进下面可编辑的“总结专用 Prompt”。</div>
-
-          <div class="rp-mem-grid">
-            <label>总结最大输出 tokens<input id="rp_big_memory_max_tokens" type="number" min="512" max="64000" step="256" class="text_pole"></label>
-            <label>保留最近消息数<input id="rp_big_memory_keep" type="number" min="0" max="100" step="1" class="text_pole"></label>
-            <label>长期记忆深度 D<input id="rp_big_memory_long_depth" type="number" min="0" max="9999" step="1" class="text_pole"></label>
-            <label>当前篇章深度 D<input id="rp_big_memory_arc_depth" type="number" min="0" max="9999" step="1" class="text_pole"></label>
-            <label>单块最大字符数<input id="rp_big_memory_chunk_chars" type="number" min="10000" max="1000000" step="10000" class="text_pole"></label>
-          </div>
-
-          <details>
-            <summary>总结专用 Prompt（可编辑）</summary>
-            <textarea id="rp_big_memory_prompt" class="text_pole rp-mem-prompt" rows="12"></textarea>
-            <button id="rp_big_memory_reset_prompt" class="menu_button">恢复默认 Prompt</button>
-          </details>
-
-          <hr>
-          <div id="rp_big_memory_status" class="rp-mem-status"></div>
-          <div id="rp_big_memory_sizes" class="rp-mem-subtle"></div>
-          <div id="rp_big_memory_busy" class="rp-mem-busy" style="display:none"></div>
-          <div class="rp-mem-row rp-mem-actions">
-            <button id="rp_big_memory_summarize" class="menu_button rp-mem-primary">🧠 总结并压缩</button>
-            <button id="rp_big_memory_save_memory" class="menu_button">💾 保存手工修改</button>
-            <button id="rp_big_memory_rollback" class="menu_button">↩ 回滚一版</button>
-          </div>
-
-          <label>🔒 长期记忆（可直接编辑；自动总结只追加新增长期事实）</label>
-          <textarea id="rp_big_memory_long" class="text_pole rp-mem-editor" rows="10" placeholder="还没有长期记忆"></textarea>
-
-          <label>📖 当前篇章（可直接编辑；每次总结都会刷新）</label>
-          <textarea id="rp_big_memory_arc" class="text_pole rp-mem-editor" rows="10" placeholder="还没有当前篇章摘要"></textarea>
-
-          <details>
-            <summary>恢复 / 故障处理</summary>
-            <div class="rp-mem-row rp-mem-actions">
-              <button id="rp_big_memory_unhide" class="menu_button">👁 恢复本插件隐藏楼层</button>
-              <button id="rp_big_memory_reset_chat" class="menu_button redWarningBG">🗑 重置此聊天记忆</button>
+        <main class="rpbm-content">
+          <section class="rpbm-page active" data-page="summary">
+            <div class="rpbm-hero">
+              <div><span class="rpbm-eyebrow">NEXT COMPRESSION</span><h3 id="rp_big_memory_summary_range">让旧剧情变成可用的长期记忆</h3><p>总结成功后才会隐藏旧楼；API 失败不会动原文。</p></div>
+              <button id="rp_big_memory_summarize" class="rpbm-primary" type="button">🧠 总结并压缩</button>
             </div>
-            <div class="rp-mem-subtle">如果你修改、删除或 Swipe 了“已经总结过”的旧楼层，插件会标记记忆可能过期，并要求重置后重新总结，避免旧摘要继续污染剧情。</div>
-          </details>
-        </div>
-      </div>`;
-    host.appendChild(wrap);
+            <div id="rp_big_memory_busy" class="rpbm-busy"></div>
+            <div class="rpbm-summary-grid">
+              <article class="rpbm-card"><span>保留最近原文</span><strong id="rp_big_memory_keep_preview">10 条</strong><small>最近互动继续保持原汁原味</small></article>
+              <article class="rpbm-card"><span>已隐藏历史</span><strong id="rp_big_memory_hidden_value">0 段</strong><small>只是从 Prompt 排除，不删除聊天</small></article>
+              <article class="rpbm-card"><span>版本回滚</span><strong id="rp_big_memory_versions_value">0 版</strong><small>总结前自动留下快照</small></article>
+            </div>
+            <div class="rpbm-inline-actions">
+              <button id="rp_big_memory_rollback" class="rpbm-secondary">↩ 回滚一版</button>
+              <button id="rp_big_memory_unhide" class="rpbm-secondary">👁 恢复隐藏楼层</button>
+            </div>
+          </section>
 
-    bindSetting('#rp_big_memory_enabled', 'enabled');
-    bindSetting('#rp_big_memory_inject', 'injectMemory');
-    bindSetting('#rp_big_memory_autohide', 'autoHide');
-    bindSetting('#rp_big_memory_profile_preset', 'useProfilePreset');
-    bindSetting('#rp_big_memory_max_tokens', 'maxOutputTokens', Number);
-    bindSetting('#rp_big_memory_keep', 'keepRecentMessages', Number);
-    bindSetting('#rp_big_memory_long_depth', 'longTermDepth', Number);
-    bindSetting('#rp_big_memory_arc_depth', 'arcDepth', Number);
-    bindSetting('#rp_big_memory_chunk_chars', 'chunkCharLimit', Number);
+          <section class="rpbm-page" data-page="api">
+            <div class="rpbm-section-head"><div><span class="rpbm-eyebrow">SECONDARY MODEL</span><h3>副 API</h3><p>不会切换你的主 RP API。</p></div></div>
+            <div class="rpbm-segmented">
+              <button type="button" data-api-mode="direct" class="active">🔗 地址 + Key</button>
+              <button type="button" data-api-mode="profile">⚙ Connection Profile</button>
+            </div>
 
-    const s = settings();
-    const prompt = wrap.querySelector('#rp_big_memory_prompt');
-    prompt.value = s.summaryPrompt;
+            <div id="rp_big_memory_direct_box" class="rpbm-api-box">
+              <label>API Base URL
+                <input id="rp_big_memory_base_url" class="text_pole" placeholder="https://openrouter.ai/api/v1" autocomplete="off">
+              </label>
+              <label>API Key
+                <div class="rpbm-key-row"><input id="rp_big_memory_api_key" class="text_pole" type="password" placeholder="sk-..." autocomplete="new-password"><button id="rp_big_memory_toggle_key" class="rpbm-mini-btn" type="button">显示</button></div>
+              </label>
+              <div class="rpbm-security-note">🔐 Key 只留在当前网页会话里，不写入扩展设置；刷新页面后需要重新填。UI 扩展本身没有安全的密钥持久化能力。</div>
+              <div class="rpbm-model-row">
+                <label>模型
+                  <select id="rp_big_memory_model_select" class="text_pole"><option value="">先拉取模型</option></select>
+                </label>
+                <button id="rp_big_memory_fetch_models" class="rpbm-secondary" type="button">↻ 拉取模型</button>
+              </div>
+              <label>模型 ID（也可手填）
+                <input id="rp_big_memory_model_manual" class="text_pole" placeholder="例如 google/gemini-2.5-flash">
+              </label>
+              <div class="rpbm-inline-actions"><button id="rp_big_memory_test" class="rpbm-primary compact" type="button">测试连接</button></div>
+              <div class="rpbm-hint">直连模式按 OpenAI-compatible API 调用 <code>/models</code> 与 <code>/chat/completions</code>。若服务商阻止浏览器跨域请求，请切到 Connection Profile。</div>
+            </div>
+
+            <div id="rp_big_memory_profile_box" class="rpbm-api-box hidden">
+              <label>Connection Profile
+                <select id="rp_big_memory_profile" class="text_pole"><option value="">选择 Profile</option></select>
+              </label>
+              <label class="rpbm-check"><input id="rp_big_memory_profile_preset" type="checkbox"> 使用该 Profile 绑定的 Settings Preset / Instruct</label>
+              <div class="rpbm-inline-actions"><button id="rp_big_memory_refresh_profiles" class="rpbm-secondary" type="button">刷新 Profile</button><button id="rp_big_memory_test_profile" class="rpbm-primary compact" type="button">测试连接</button></div>
+            </div>
+          </section>
+
+          <section class="rpbm-page" data-page="memory">
+            <div class="rpbm-section-head"><div><span class="rpbm-eyebrow">EDITABLE MEMORY</span><h3>当前记忆</h3><p>你可以随时人工修正，再保存回聊天。</p></div><button id="rp_big_memory_save_memory" class="rpbm-primary compact">💾 保存修改</button></div>
+            <div class="rpbm-memory-block"><div class="rpbm-memory-title"><b>🔒 长期记忆</b><span id="rp_big_memory_long_meta"></span></div><textarea id="rp_big_memory_long" class="text_pole" rows="13" placeholder="尚无长期记忆"></textarea></div>
+            <div class="rpbm-memory-block"><div class="rpbm-memory-title"><b>📖 当前篇章</b><span id="rp_big_memory_arc_meta"></span></div><textarea id="rp_big_memory_arc" class="text_pole" rows="11" placeholder="尚无当前篇章摘要"></textarea></div>
+          </section>
+
+          <section class="rpbm-page" data-page="advanced">
+            <div class="rpbm-section-head"><div><span class="rpbm-eyebrow">ADVANCED</span><h3>高级设置</h3></div></div>
+            <div class="rpbm-options-grid">
+              <label>保留最近消息<input id="rp_big_memory_keep" type="number" min="0" max="100" step="1" class="text_pole"></label>
+              <label>总结最大输出 tokens<input id="rp_big_memory_max_tokens" type="number" min="512" max="64000" step="256" class="text_pole"></label>
+              <label>长期记忆深度 D<input id="rp_big_memory_long_depth" type="number" min="0" max="9999" class="text_pole"></label>
+              <label>当前篇章深度 D<input id="rp_big_memory_arc_depth" type="number" min="0" max="9999" class="text_pole"></label>
+              <label>单块最大字符数<input id="rp_big_memory_chunk_chars" type="number" min="10000" max="1000000" step="10000" class="text_pole"></label>
+            </div>
+            <div class="rpbm-toggles">
+              <label class="rpbm-check"><input id="rp_big_memory_enabled" type="checkbox"> 启用记忆注入系统</label>
+              <label class="rpbm-check"><input id="rp_big_memory_inject" type="checkbox"> 将记忆注入主 RP Prompt</label>
+              <label class="rpbm-check"><input id="rp_big_memory_autohide" type="checkbox"> 总结成功后自动隐藏旧楼</label>
+            </div>
+            <details class="rpbm-details"><summary>总结专用 Prompt</summary><textarea id="rp_big_memory_prompt" class="text_pole" rows="16"></textarea><button id="rp_big_memory_reset_prompt" class="rpbm-secondary">恢复默认 Prompt</button></details>
+            <div class="rpbm-danger-zone"><div><b>故障处理</b><p>只清理本插件记忆，不删除聊天。</p></div><button id="rp_big_memory_reset_chat" class="rpbm-danger">重置此聊天记忆</button></div>
+          </section>
+        </main>
+      </section>`;
+    document.body.appendChild(overlay);
+
+    fab.addEventListener('click', openModal);
+    overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(); });
+    overlay.querySelector('#rp_big_memory_close').addEventListener('click', closeModal);
+    document.addEventListener('keydown', e => { if (e.key === 'Escape' && overlay.classList.contains('open')) closeModal(); });
+
+    overlay.querySelectorAll('.rpbm-tab').forEach(btn => btn.addEventListener('click', () => setTab(btn.dataset.tab)));
+    overlay.querySelectorAll('[data-api-mode]').forEach(btn => btn.addEventListener('click', async () => {
+        settings().apiMode = btn.dataset.apiMode;
+        await saveSettings();
+        updateApiModeUI();
+        refreshUI();
+    }));
+
+    bindInput('#rp_big_memory_base_url', 'directBaseUrl', v => v.trim());
+    bindInput('#rp_big_memory_profile_preset', 'useProfilePreset');
+    bindInput('#rp_big_memory_max_tokens', 'maxOutputTokens', Number);
+    bindInput('#rp_big_memory_keep', 'keepRecentMessages', Number);
+    bindInput('#rp_big_memory_long_depth', 'longTermDepth', Number);
+    bindInput('#rp_big_memory_arc_depth', 'arcDepth', Number);
+    bindInput('#rp_big_memory_chunk_chars', 'chunkCharLimit', Number);
+    bindInput('#rp_big_memory_enabled', 'enabled');
+    bindInput('#rp_big_memory_inject', 'injectMemory');
+    bindInput('#rp_big_memory_autohide', 'autoHide');
+
+    const keyInput = overlay.querySelector('#rp_big_memory_api_key');
+    keyInput.value = runtimeApiKey;
+    keyInput.addEventListener('input', () => { runtimeApiKey = keyInput.value; });
+    overlay.querySelector('#rp_big_memory_toggle_key').addEventListener('click', e => {
+        keyInput.type = keyInput.type === 'password' ? 'text' : 'password';
+        e.currentTarget.textContent = keyInput.type === 'password' ? '显示' : '隐藏';
+    });
+
+    const modelSelect = overlay.querySelector('#rp_big_memory_model_select');
+    const modelManual = overlay.querySelector('#rp_big_memory_model_manual');
+    modelSelect.addEventListener('change', async () => {
+        if (!modelSelect.value) return;
+        settings().directModel = modelSelect.value;
+        modelManual.value = modelSelect.value;
+        await saveSettings();
+        refreshUI();
+    });
+    modelManual.addEventListener('change', async () => {
+        settings().directModel = modelManual.value.trim();
+        await saveSettings();
+        refreshUI();
+    });
+
+    const profile = overlay.querySelector('#rp_big_memory_profile');
+    profile.addEventListener('change', async () => {
+        settings().profileId = profile.value;
+        await saveSettings();
+        refreshUI();
+    });
+
+    overlay.querySelector('#rp_big_memory_fetch_models').addEventListener('click', fetchModels);
+    overlay.querySelector('#rp_big_memory_refresh_profiles').addEventListener('click', refreshProfileSelect);
+    overlay.querySelector('#rp_big_memory_test').addEventListener('click', testApi);
+    overlay.querySelector('#rp_big_memory_test_profile').addEventListener('click', testApi);
+    overlay.querySelector('#rp_big_memory_summarize').addEventListener('click', summarizeNow);
+    overlay.querySelector('#rp_big_memory_save_memory').addEventListener('click', saveEditedMemory);
+    overlay.querySelector('#rp_big_memory_rollback').addEventListener('click', rollback);
+    overlay.querySelector('#rp_big_memory_unhide').addEventListener('click', unhideAll);
+    overlay.querySelector('#rp_big_memory_reset_chat').addEventListener('click', resetChatMemory);
+
+    const prompt = overlay.querySelector('#rp_big_memory_prompt');
+    prompt.value = settings().summaryPrompt;
     prompt.addEventListener('change', async () => {
-        s.summaryPrompt = prompt.value.trim() || DEFAULT_SUMMARY_PROMPT;
+        settings().summaryPrompt = prompt.value.trim() || DEFAULT_SUMMARY_PROMPT;
         await saveSettings();
     });
-
-    wrap.querySelector('#rp_big_memory_profile').addEventListener('change', async e => {
-        s.profileId = e.target.value;
-        await saveSettings();
-        refreshProfileInfo();
-    });
-    wrap.querySelector('#rp_big_memory_refresh_profiles').addEventListener('click', refreshProfileSelect);
-    wrap.querySelector('#rp_big_memory_test').addEventListener('click', testApi);
-    wrap.querySelector('#rp_big_memory_summarize').addEventListener('click', summarizeNow);
-    wrap.querySelector('#rp_big_memory_save_memory').addEventListener('click', saveEditedMemory);
-    wrap.querySelector('#rp_big_memory_rollback').addEventListener('click', rollback);
-    wrap.querySelector('#rp_big_memory_unhide').addEventListener('click', unhideAll);
-    wrap.querySelector('#rp_big_memory_reset_chat').addEventListener('click', resetChatMemory);
-    wrap.querySelector('#rp_big_memory_reset_prompt').addEventListener('click', async () => {
-        s.summaryPrompt = DEFAULT_SUMMARY_PROMPT;
+    overlay.querySelector('#rp_big_memory_reset_prompt').addEventListener('click', async () => {
+        settings().summaryPrompt = DEFAULT_SUMMARY_PROMPT;
         prompt.value = DEFAULT_SUMMARY_PROMPT;
         await saveSettings();
         toast('success', '已恢复默认总结 Prompt。');
     });
 
     refreshProfileSelect();
+    updateApiModeUI();
     refreshUI();
 }
 
@@ -747,19 +971,15 @@ function registerEvents() {
     const et = c.eventTypes;
     if (!es || !et) return;
 
-    const onChat = async () => {
-        await updateInjection();
-        await refreshUI();
-    };
+    const onChat = async () => { await updateInjection(); await refreshUI(); };
     es.on(et.CHAT_CHANGED, onChat);
     registeredListeners.push([et.CHAT_CHANGED, onChat]);
 
-    const editEvents = [
+    for (const [eventName, label] of [
         [et.MESSAGE_EDITED, '编辑'],
         [et.MESSAGE_DELETED, '删除'],
         [et.MESSAGE_SWIPED, 'Swipe'],
-    ].filter(([name]) => !!name);
-    for (const [eventName, label] of editEvents) {
+    ].filter(([name]) => !!name)) {
         const fn = id => markDirty(id, label);
         es.on(eventName, fn);
         registeredListeners.push([eventName, fn]);
@@ -772,70 +992,43 @@ function registerEvents() {
     }
 }
 
-let panelObserver = null;
-
-function ensurePanelMounted() {
-    buildPanel();
-    if (document.querySelector('#rp_big_memory_panel')) return;
-    if (panelObserver) return;
-
-    panelObserver = new MutationObserver(() => {
-        buildPanel();
-        if (document.querySelector('#rp_big_memory_panel')) {
-            refreshProfileSelect();
-            refreshUI();
-            panelObserver?.disconnect();
-            panelObserver = null;
-        }
-    });
-    panelObserver.observe(document.documentElement || document.body, { childList: true, subtree: true });
-}
-
 export async function init() {
-    if (initialized) {
-        ensurePanelMounted();
-        return;
-    }
+    if (initialized) return;
     initialized = true;
     settings();
-    ensurePanelMounted();
+    buildUI();
     registerEvents();
     await updateInjection();
     await refreshUI();
-    console.info('[RP Big Memory] v0.1.2 initialized');
+    console.info('[RP Big Memory] v0.2.0 initialized');
 }
 
 export async function clean() {
     try {
-        panelObserver?.disconnect();
-        panelObserver = null;
         const c = ctx();
         for (const [eventName, fn] of registeredListeners) c.eventSource?.removeListener?.(eventName, fn);
         registeredListeners = [];
         await c.setExtensionPrompt(LONG_PROMPT_ID, '', 1, 16, false, 0);
         await c.setExtensionPrompt(ARC_PROMPT_ID, '', 1, 6, false, 0);
-        document.querySelector('#rp_big_memory_panel')?.remove();
+        document.querySelector('#rp_big_memory_overlay')?.remove();
+        document.querySelector('#rp_big_memory_fab')?.remove();
+        document.body.classList.remove('rpbm-no-scroll');
     } catch (e) {
         console.warn('[RP Big Memory] cleanup failed', e);
     }
     initialized = false;
 }
 
-
-// Third-party extension bootstrap. Wait until SillyTavern's context is actually ready
-// before touching extension settings. This avoids mobile/slow-load race conditions.
 async function waitForSillyTavernReady(timeoutMs = 60000) {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
         try {
             const c = getContext();
-            if (c?.extensionSettings && c?.eventSource && c?.eventTypes) return c;
-        } catch {
-            // Core is still booting.
-        }
+            if (c?.extensionSettings && c?.eventSource && c?.eventTypes && document.body) return c;
+        } catch {}
         await new Promise(resolve => setTimeout(resolve, 250));
     }
-    throw new Error('等待 SillyTavern 初始化超时。请刷新页面后重试。');
+    throw new Error('等待 SillyTavern 初始化超时。');
 }
 
 async function selfStart() {
@@ -848,6 +1041,4 @@ async function selfStart() {
     }
 }
 
-// A third-party extension module is normally loaded after the core scripts, but
-// we intentionally do not rely on DOMContentLoaded ordering.
 void selfStart();
