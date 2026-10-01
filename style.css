@@ -1,0 +1,27 @@
+.rp-big-memory { margin-top: 8px; }
+.rp-big-memory .inline-drawer-content { display: none; padding: 8px 2px; }
+.rp-big-memory .rp-mem-note,
+.rp-big-memory .rp-mem-status,
+.rp-big-memory .rp-mem-busy {
+    padding: 8px 10px;
+    border-radius: 8px;
+    margin: 6px 0 10px;
+    background: color-mix(in srgb, var(--SmartThemeBodyColor, #222) 82%, transparent);
+}
+.rp-big-memory .rp-mem-subtle { opacity: .72; font-size: .9em; margin: 4px 0 8px; }
+.rp-big-memory .rp-mem-danger { color: var(--warning-color, #ff9c7a); font-weight: 700; }
+.rp-big-memory .rp-mem-busy { font-weight: 700; }
+.rp-big-memory .rp-mem-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rp-big-memory .rp-mem-row .flex1 { flex: 1 1 260px; min-width: 180px; }
+.rp-big-memory .rp-mem-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 10px 0; }
+.rp-big-memory .rp-mem-grid label { display: flex; flex-direction: column; gap: 4px; }
+.rp-big-memory .rp-mem-editor,
+.rp-big-memory .rp-mem-prompt { width: 100%; resize: vertical; min-height: 120px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.rp-big-memory .rp-mem-actions { margin: 8px 0 12px; }
+.rp-big-memory .rp-mem-primary { font-weight: 700; }
+.rp-big-memory details { margin: 8px 0; }
+.rp-big-memory summary { cursor: pointer; user-select: none; margin-bottom: 6px; }
+.rp-big-memory hr { opacity: .2; margin: 12px 0; }
+@media (max-width: 720px) {
+    .rp-big-memory .rp-mem-grid { grid-template-columns: 1fr; }
+}

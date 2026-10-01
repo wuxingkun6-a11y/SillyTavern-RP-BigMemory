@@ -1,0 +1,15 @@
+{
+  "display_name": "RP 大总结 / Big Memory",
+  "loading_order": 120,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Dio + ChatGPT",
+  "version": "0.1.0",
+  "homePage": "",
+  "hooks": {
+    "activate": "init",
+    "clean": "clean"
+  }
+}
