@@ -1,3 +1,6 @@
+import { getContext } from '../../../extensions.js';
+import { ConnectionManagerRequestService } from '../../shared.js';
+
 const EXT_KEY = 'rpBigMemory';
 const META_KEY = 'rpBigMemoryState';
 const LONG_PROMPT_ID = 'rp-big-memory-long-term';
@@ -54,9 +57,14 @@ let initialized = false;
 let registeredListeners = [];
 
 function ctx() {
-    const st = globalThis.SillyTavern || window.SillyTavern;
-    if (!st?.getContext) throw new Error('SillyTavern context unavailable');
-    return st.getContext();
+    const c = getContext();
+    if (!c) throw new Error('SillyTavern context unavailable');
+    return c;
+}
+
+function hasActiveChat() {
+    const c = ctx();
+    return !!c.chatMetadata && Array.isArray(c.chat);
 }
 
 
@@ -93,6 +101,10 @@ function blankState() {
 
 function state() {
     const c = ctx();
+    // Settings UI should still be able to load before a chat is selected.
+    // In that case return a transient blank state; actions that mutate chat memory
+    // explicitly require an active chat.
+    if (!c.chatMetadata || typeof c.chatMetadata !== 'object') return blankState();
     if (!c.chatMetadata[META_KEY]) c.chatMetadata[META_KEY] = blankState();
     const st = c.chatMetadata[META_KEY];
     const base = blankState();
@@ -108,6 +120,7 @@ async function saveSettings() {
 }
 
 async function saveState() {
+    if (!hasActiveChat()) throw new Error('请先打开一个聊天。');
     await ctx().saveMetadata();
 }
 
@@ -140,6 +153,11 @@ function uniqueBulletAppend(existing, additions) {
 async function updateInjection() {
     const c = ctx();
     const s = settings();
+    if (!hasActiveChat()) {
+        await c.setExtensionPrompt?.(LONG_PROMPT_ID, '', 1, Number(s.longTermDepth) || 16, false, 0);
+        await c.setExtensionPrompt?.(ARC_PROMPT_ID, '', 1, Number(s.arcDepth) || 6, false, 0);
+        return;
+    }
     const st = state();
     if (!s.enabled || !s.injectMemory) {
         await c.setExtensionPrompt(LONG_PROMPT_ID, '', 1, Number(s.longTermDepth) || 16, false, 0);
@@ -167,9 +185,8 @@ async function updateInjection() {
 }
 
 function profileService() {
-    const c = ctx();
-    if (!c.ConnectionManagerRequestService) throw new Error('当前 SillyTavern 没有 ConnectionManagerRequestService，请更新 ST 或启用 Connection Manager。');
-    return c.ConnectionManagerRequestService;
+    if (!ConnectionManagerRequestService) throw new Error('当前 SillyTavern 没有 ConnectionManagerRequestService，请更新 ST 或启用 Connection Manager。');
+    return ConnectionManagerRequestService;
 }
 
 function supportedProfiles() {
@@ -377,6 +394,7 @@ function getPlannedRange() {
 }
 
 async function summarizeNow() {
+    if (!hasActiveChat()) return toast('warning', '请先打开一个聊天。');
     const s = settings();
     const st = state();
     if (!s.profileId) return toast('warning', '先选择一个副 API Connection Profile。');
@@ -453,6 +471,7 @@ async function testApi() {
 }
 
 async function saveEditedMemory() {
+    if (!hasActiveChat()) return toast('warning', '请先打开一个聊天。');
     const st = state();
     pushHistorySnapshot(st, '手动编辑前快照');
     st.longTerm = normalizeMemoryText(document.querySelector('#rp_big_memory_long')?.value ?? st.longTerm);
@@ -464,6 +483,7 @@ async function saveEditedMemory() {
 }
 
 async function rollback() {
+    if (!hasActiveChat()) return toast('warning', '请先打开一个聊天。');
     const st = state();
     const snap = st.history?.pop();
     if (!snap) return toast('info', '没有可回滚的历史版本。');
@@ -488,6 +508,7 @@ async function rollback() {
 }
 
 async function unhideAll() {
+    if (!hasActiveChat()) return toast('warning', '请先打开一个聊天。');
     const st = state();
     if (!st.hiddenRanges?.length) return toast('info', '没有由本插件记录的隐藏范围。');
     try {
@@ -502,6 +523,7 @@ async function unhideAll() {
 }
 
 async function resetChatMemory() {
+    if (!hasActiveChat()) return toast('warning', '请先打开一个聊天。');
     const c = ctx();
     const st = state();
     const ok = window.confirm('这会恢复本插件隐藏的楼层，并清空当前聊天的大总结、进度和版本历史。不会删除聊天原文。确定吗？');
@@ -519,6 +541,7 @@ async function resetChatMemory() {
 }
 
 async function markDirty(messageId, reason) {
+    if (!hasActiveChat()) return;
     const st = state();
     if (st.summarizedUntil < 0) return;
     const id = Number(messageId);
@@ -555,8 +578,12 @@ async function refreshUI() {
     const panel = document.querySelector('#rp_big_memory_panel');
     if (!panel) return;
     const s = settings();
+    const activeChat = hasActiveChat();
     const st = state();
-    const range = getPlannedRange();
+    const range = activeChat ? getPlannedRange() : { start: 0, end: -1, keep: Number(s.keepRecentMessages) || 0, total: 0 };
+
+    panel.querySelectorAll('#rp_big_memory_summarize, #rp_big_memory_save_memory, #rp_big_memory_rollback, #rp_big_memory_unhide, #rp_big_memory_reset_chat')
+        .forEach(el => { el.disabled = !activeChat; });
 
     const long = document.querySelector('#rp_big_memory_long');
     const arc = document.querySelector('#rp_big_memory_arc');
@@ -565,8 +592,12 @@ async function refreshUI() {
 
     const status = document.querySelector('#rp_big_memory_status');
     if (status) {
-        const dirty = st.dirty ? `<span class="rp-mem-danger">⚠ 已总结历史被修改：${escapeHtml(st.dirtyReason || '未知')}</span><br>` : '';
-        status.innerHTML = `${dirty}已总结至：<b>${st.summarizedUntil >= 0 ? `#${st.summarizedUntil}` : '尚未总结'}</b> ｜ 下次范围：<b>${range.end >= range.start ? `#${range.start}–#${range.end}` : '暂无'}</b> ｜ 隐藏段：${st.hiddenRanges?.length || 0} ｜ 可回滚：${st.history?.length || 0}`;
+        if (!activeChat) {
+            status.innerHTML = '<b>请先打开一个聊天。</b> 插件设置已加载；聊天记忆功能会在进入聊天后启用。';
+        } else {
+            const dirty = st.dirty ? `<span class="rp-mem-danger">⚠ 已总结历史被修改：${escapeHtml(st.dirtyReason || '未知')}</span><br>` : '';
+            status.innerHTML = `${dirty}已总结至：<b>${st.summarizedUntil >= 0 ? `#${st.summarizedUntil}` : '尚未总结'}</b> ｜ 下次范围：<b>${range.end >= range.start ? `#${range.start}–#${range.end}` : '暂无'}</b> ｜ 隐藏段：${st.hiddenRanges?.length || 0} ｜ 可回滚：${st.history?.length || 0}`;
+        }
     }
 
     const [lt, at] = await Promise.all([tokenCount(st.longTerm), tokenCount(st.currentArc)]);
@@ -771,7 +802,7 @@ export async function init() {
     registerEvents();
     await updateInjection();
     await refreshUI();
-    console.info('[RP Big Memory] v0.1.1 initialized');
+    console.info('[RP Big Memory] v0.1.2 initialized');
 }
 
 export async function clean() {
@@ -791,18 +822,32 @@ export async function clean() {
 }
 
 
-// Third-party extensions are not guaranteed to receive manifest hooks.activate.
-// Self-initialize when the page is ready; init() is idempotent, so this is safe
-// even on clients that do invoke the manifest hook.
-function selfStart() {
-    Promise.resolve(init()).catch(error => {
-        console.error('[RP Big Memory] initialization failed', error);
-        toast('error', `初始化失败：${error?.message || error}`);
-    });
+// Third-party extension bootstrap. Wait until SillyTavern's context is actually ready
+// before touching extension settings. This avoids mobile/slow-load race conditions.
+async function waitForSillyTavernReady(timeoutMs = 60000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+        try {
+            const c = getContext();
+            if (c?.extensionSettings && c?.eventSource && c?.eventTypes) return c;
+        } catch {
+            // Core is still booting.
+        }
+        await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    throw new Error('等待 SillyTavern 初始化超时。请刷新页面后重试。');
 }
 
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', selfStart, { once: true });
-} else {
-    selfStart();
+async function selfStart() {
+    try {
+        await waitForSillyTavernReady();
+        await init();
+    } catch (error) {
+        console.error('[RP Big Memory] initialization failed', error);
+        toast('error', `初始化失败：${error?.message || error}`);
+    }
 }
+
+// A third-party extension module is normally loaded after the core scripts, but
+// we intentionally do not rely on DOMContentLoaded ordering.
+void selfStart();

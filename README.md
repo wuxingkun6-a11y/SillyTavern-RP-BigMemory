@@ -1,4 +1,11 @@
-# RP 大总结 / Big Memory v0.1.1
+
+## v0.1.2 修复
+
+- 修复移动端/慢加载时扩展已安装但设置面板不出现的问题：等待 SillyTavern 核心 API 真正就绪后再初始化。
+- 改为直接使用官方 `ConnectionManagerRequestService`，修复副 API Profile 读取与请求服务引用。
+- 未打开聊天时也能显示插件设置；记忆操作会提示先进入聊天，不再因 `chatMetadata` 尚未建立而初始化失败。
+
+# RP 大总结 / Big Memory v0.1.2
 
 一个面向长篇 SillyTavern RP 的聊天压缩扩展。它使用 **独立 Connection Profile（副 API）** 总结旧聊天，把摘要存进当前聊天的 `chatMetadata`，再通过 extension prompt 注入主 RP；总结成功后可用 SillyTavern 原生 `/hide` 隐藏已总结旧楼层。
 
