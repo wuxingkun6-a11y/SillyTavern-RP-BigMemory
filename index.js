@@ -54,9 +54,11 @@ let initialized = false;
 let registeredListeners = [];
 
 function ctx() {
-    if (!window.SillyTavern?.getContext) throw new Error('SillyTavern context unavailable');
-    return window.SillyTavern.getContext();
+    const st = globalThis.SillyTavern || window.SillyTavern;
+    if (!st?.getContext) throw new Error('SillyTavern context unavailable');
+    return st.getContext();
 }
+
 
 function toast(type, message, title = 'RP 大总结') {
     if (window.toastr?.[type]) window.toastr[type](message, title);
@@ -739,27 +741,43 @@ function registerEvents() {
     }
 }
 
-export async function init() {
-    if (initialized) return;
-    initialized = true;
-    settings();
+let panelObserver = null;
+
+function ensurePanelMounted() {
     buildPanel();
-    if (!document.querySelector('#rp_big_memory_panel')) {
-        // Extensions panel may render slightly later.
-        setTimeout(() => {
-            buildPanel();
+    if (document.querySelector('#rp_big_memory_panel')) return;
+    if (panelObserver) return;
+
+    panelObserver = new MutationObserver(() => {
+        buildPanel();
+        if (document.querySelector('#rp_big_memory_panel')) {
             refreshProfileSelect();
             refreshUI();
-        }, 1000);
+            panelObserver?.disconnect();
+            panelObserver = null;
+        }
+    });
+    panelObserver.observe(document.documentElement || document.body, { childList: true, subtree: true });
+}
+
+export async function init() {
+    if (initialized) {
+        ensurePanelMounted();
+        return;
     }
+    initialized = true;
+    settings();
+    ensurePanelMounted();
     registerEvents();
     await updateInjection();
     await refreshUI();
-    console.info('[RP Big Memory] v0.1.0 initialized');
+    console.info('[RP Big Memory] v0.1.1 initialized');
 }
 
 export async function clean() {
     try {
+        panelObserver?.disconnect();
+        panelObserver = null;
         const c = ctx();
         for (const [eventName, fn] of registeredListeners) c.eventSource?.removeListener?.(eventName, fn);
         registeredListeners = [];
@@ -770,4 +788,21 @@ export async function clean() {
         console.warn('[RP Big Memory] cleanup failed', e);
     }
     initialized = false;
+}
+
+
+// Third-party extensions are not guaranteed to receive manifest hooks.activate.
+// Self-initialize when the page is ready; init() is idempotent, so this is safe
+// even on clients that do invoke the manifest hook.
+function selfStart() {
+    Promise.resolve(init()).catch(error => {
+        console.error('[RP Big Memory] initialization failed', error);
+        toast('error', `初始化失败：${error?.message || error}`);
+    });
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', selfStart, { once: true });
+} else {
+    selfStart();
 }

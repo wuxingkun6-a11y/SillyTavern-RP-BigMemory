@@ -6,10 +6,12 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Dio + ChatGPT",
-  "version": "0.1.0",
-  "homePage": "",
+  "version": "0.1.1",
+  "homePage": "https://github.com/wuxingkun6-a11y/SillyTavern-RP-BigMemory",
   "hooks": {
     "activate": "init",
     "clean": "clean"
-  }
+  },
+  "auto_update": true,
+  "minimum_client_version": "1.17.0"
 }
