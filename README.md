@@ -1,15 +1,15 @@
 
-## v0.1.2 修复
+## v0.1.3 修复
 
 - 修复移动端/慢加载时扩展已安装但设置面板不出现的问题：等待 SillyTavern 核心 API 真正就绪后再初始化。
 - 改为直接使用官方 `ConnectionManagerRequestService`，修复副 API Profile 读取与请求服务引用。
 - 未打开聊天时也能显示插件设置；记忆操作会提示先进入聊天，不再因 `chatMetadata` 尚未建立而初始化失败。
 
-# RP 大总结 / Big Memory v0.1.2
+# RP 大总结 / Big Memory v0.1.3
 
 一个面向长篇 SillyTavern RP 的聊天压缩扩展。它使用 **独立 Connection Profile（副 API）** 总结旧聊天，把摘要存进当前聊天的 `chatMetadata`，再通过 extension prompt 注入主 RP；总结成功后可用 SillyTavern 原生 `/hide` 隐藏已总结旧楼层。
 
-## v0.1.1 已实现
+## v0.1.3 已实现
 
 - 独立副 API：选择 SillyTavern Connection Manager 中已有的 Connection Profile。
 - 两种副 API 预设模式：
@@ -28,6 +28,12 @@
 - 可以恢复由插件记录的隐藏楼层。
 - 已总结旧楼被编辑 / 删除 / Swipe 后，会标记记忆可能过期并阻止继续增量总结。
 - 每个聊天独立保存记忆与进度。
+
+
+## 兼容性
+
+- 最低 SillyTavern 版本：**1.15.0**。
+- 1.15.0 已包含扩展调用 ConnectionManagerRequestService 所需能力。
 
 ## 安装
 
@@ -72,7 +78,7 @@ SillyTavern/data/<你的用户>/extensions/SillyTavern-RP-BigMemory
 
 - `/hide` 是“从主模型 prompt 排除”，不是删除。原聊天仍在。
 - 如果恢复隐藏楼层，同时又保持记忆注入，会出现“原文 + 摘要”同时进入 prompt 的重复信息；需要时可关闭“将记忆注入主 RP Prompt”。
-- v0.1.1 还没有自动 token 阈值提醒、世界书同步、逐条锁定长期记忆、Diff 审核、分支继承 UI。这些适合后续版本。
+- v0.1.3 还没有自动 token 阈值提醒、世界书同步、逐条锁定长期记忆、Diff 审核、分支继承 UI。这些适合后续版本。
 - 不同副模型/服务商可能对输入内容有自己的限制；副 API 拒绝或返回异常时，插件不会隐藏原文。
 
 ## 推荐初始设置
@@ -86,7 +92,7 @@ SillyTavern/data/<你的用户>/extensions/SillyTavern-RP-BigMemory
 对于单条非常长的 RP，可适当把“保留最近消息数”提高到 12–16，或把单块字符数根据副模型上下文能力调整。
 
 
-### v0.1.1 修复
+### v0.1.3 修复
 
 - 修复第三方扩展安装成功但设置面板不出现：入口脚本现在会自行初始化，不再只依赖 manifest hook。
 - 设置面板改为等待 SillyTavern 扩展设置 DOM 出现，改善手机端/延迟加载场景。
