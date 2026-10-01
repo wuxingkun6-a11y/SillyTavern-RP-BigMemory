@@ -992,15 +992,36 @@ function registerEvents() {
     }
 }
 
-export async function init() {
-    if (initialized) return;
-    initialized = true;
+export 
+function buildFallbackLauncher() {
+    if (document.querySelector('#rp_big_memory_settings_launcher')) return;
+    const host = document.querySelector('#extensions_settings') || document.querySelector('#extensions_settings2');
+    if (!host) return;
+    const row = document.createElement('div');
+    row.id = 'rp_big_memory_settings_launcher';
+    row.className = 'extension_container rpbm-fallback-launcher';
+    row.innerHTML = `<div class="rpbm-fallback-row"><div><b>🧠 RP 大总结 / Big Memory</b><small>独立面板模式</small></div><button type="button" class="menu_button" id="rp_big_memory_open_fallback">打开大总结</button></div>`;
+    host.appendChild(row);
+    row.querySelector('#rp_big_memory_open_fallback')?.addEventListener('click', () => {
+        buildUI();
+        openModal();
+    });
+}
+
+async function init() {
+    if (initialized) {
+        buildUI();
+        buildFallbackLauncher();
+        return;
+    }
     settings();
     buildUI();
+    buildFallbackLauncher();
     registerEvents();
+    initialized = true;
     await updateInjection();
     await refreshUI();
-    console.info('[RP Big Memory] v0.2.0 initialized');
+    console.info('[RP Big Memory] v0.2.1 initialized');
 }
 
 export async function clean() {
@@ -1035,7 +1056,18 @@ async function selfStart() {
     try {
         await waitForSillyTavernReady();
         await init();
+        // ST mobile layouts can rebuild parts of the page after extensions load.
+        // Keep the lightweight launchers alive without duplicating the modal.
+        setInterval(() => {
+            try {
+                buildUI();
+                buildFallbackLauncher();
+            } catch (e) {
+                console.warn('[RP Big Memory] launcher remount failed', e);
+            }
+        }, 3000);
     } catch (error) {
+        initialized = false;
         console.error('[RP Big Memory] initialization failed', error);
         toast('error', `初始化失败：${error?.message || error}`);
     }

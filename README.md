@@ -1,8 +1,10 @@
-# RP 大总结 / Big Memory v0.2.0
+# RP 大总结 / Big Memory v0.2.1
+
+> v0.2.1：增强移动端入口可见性。主页右侧中部固定显示「🧠 总结」启动标签；扩展设置页同时保留一个轻量“打开大总结”备用入口，功能仍在独立弹窗中。
 
 面向长篇 SillyTavern RP 的独立记忆压缩面板。
 
-## v0.2.0
+## v0.2.1
 
 - 重做 UI：不再塞进 Extensions 设置页。
 - 右下角独立 `🧠` 悬浮按钮，点击打开 Big Memory 面板；移动端使用大尺寸底部面板。
@@ -33,7 +35,7 @@ https://generativelanguage.googleapis.com/v1beta/openai
 
 如果服务商禁止浏览器跨域请求（CORS），请改用 Connection Profile 模式。
 
-> SillyTavern 官方明确不建议把 API Key 保存在 UI 扩展的 `extensionSettings` 中，因为它是明文客户端设置。v0.2.0 因此只在当前网页会话保存直连 Key。若未来需要安全的长期保存，需要配合 server plugin。
+> SillyTavern 官方明确不建议把 API Key 保存在 UI 扩展的 `extensionSettings` 中，因为它是明文客户端设置。v0.2.1 因此只在当前网页会话保存直连 Key。若未来需要安全的长期保存，需要配合 server plugin。
 
 ## 使用
 
